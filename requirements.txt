@@ -1,0 +1,20 @@
+# Core dependencies
+opencv-python==4.8.*
+pandas==2.1.*
+moviepy==1.0.*
+paddleocr==2.7.*
+ultralytics==8.0.*
+
+# New audio + AI dependencies
+librosa==0.10.*
+soundfile==0.12.*
+google-generativeai==0.3.*
+av==12.0.*
+loguru==0.7.*
+
+# Testing
+pytest==7.4.*
+pytest-asyncio==0.23.*
+
+# Utilities
+matplotlib==3.8.*

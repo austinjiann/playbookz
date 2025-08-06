@@ -43,7 +43,7 @@ def adjustBoundaries(coords, screen):
 
 
 
-fileSource = 'highlights (online-video-cutter.com).mp4' 
+fileSource = '/Users/austinjian/Downloads/yt1z.net - 5 Goals in 9 Minutes – The Legendary Lewandowski Show Bayern München vs. VfL Wolfsburg (1080p).mp4' 
 fileTarget = 'test_vide0_processed.mp4' 
 cropCoords = [100,100,500,500] 
 

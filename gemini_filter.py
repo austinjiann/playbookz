@@ -79,28 +79,8 @@ class GeminiFilter:
         self.cache = GeminiCache()
         self.semaphore = asyncio.Semaphore(config.GEMINI_MAX_CONCURRENT)
         
-        # Prompt for football moment detection
-        self.prompt = """
-        You are analyzing a single frame from a football (soccer) video to determine if it shows an exciting moment.
-        
-        Look for these indicators of exciting football moments:
-        - Players celebrating (arms raised, hugging, running with joy)
-        - Goal celebrations or reactions
-        - Crowd celebrations visible
-        - Players in emotional states (joy, excitement)
-        - Multiple players converging or reacting to an event
-        
-        Do NOT consider these as exciting:
-        - Normal gameplay without celebration
-        - Players walking or in neutral poses
-        - Static shots of the field
-        - Referee or coaching staff without player excitement
-        
-        Respond with ONLY "YES" if this appears to be an exciting football moment with visible celebration or strong emotional reaction.
-        Respond with ONLY "NO" if this appears to be normal gameplay or non-exciting content.
-        
-        Your response must be exactly one word: YES or NO.
-        """
+        # Use sports-specific prompt from config
+        self.prompt = config.GEMINI_PROMPT_TEMPLATE
     
     def _hash_frame(self, frame: np.ndarray) -> str:
         """Generate SHA-1 hash of frame for caching."""

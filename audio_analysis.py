@@ -35,7 +35,7 @@ class AudioPeak:
 
 def extract_audio_fast(video_path: str) -> str:
     """
-    Extract audio from video using PyAV and save as temporary WAV file.
+    Extract audio from video using librosa directly.
     
     Args:
         video_path: Path to input video file
@@ -50,32 +50,14 @@ def extract_audio_fast(video_path: str) -> str:
     temp_wav.close()
     
     try:
-        # Open video container
-        container = av.open(video_path)
-        audio_stream = container.streams.audio[0]
+        # Use librosa to load and save audio directly
+        y, sr = librosa.load(video_path, sr=config.AUDIO_SR, mono=True)
         
-        # Create output container
-        output = av.open(temp_wav.name, 'w')
-        out_stream = output.add_stream('pcm_s16le', rate=config.AUDIO_SR, channels=1)
+        # Save as WAV file
+        import soundfile as sf
+        sf.write(temp_wav.name, y, config.AUDIO_SR)
         
-        # Process audio frames
-        frame_count = 0
-        for frame in container.decode(audio_stream):
-            # Resample and convert to mono
-            frame = frame.resample(format=av.AudioFormat('s16').packed, rate=config.AUDIO_SR, channels=1)
-            
-            for packet in out_stream.encode(frame):
-                output.mux(packet)
-            frame_count += 1
-        
-        # Flush encoder
-        for packet in out_stream.encode():
-            output.mux(packet)
-            
-        output.close()
-        container.close()
-        
-        logger.info(f"Audio extracted successfully: {frame_count} frames processed")
+        logger.info(f"Audio extracted successfully: {len(y)} samples at {sr}Hz")
         return temp_wav.name
         
     except Exception as e:
@@ -207,9 +189,37 @@ def detect_peaks(rms_envelope: np.ndarray, duration: float,
     return peaks
 
 
+def generate_fallback_timestamps(duration: float) -> List[float]:
+    """
+    Generate fallback timestamps for sampling when no audio peaks are found.
+    
+    Args:
+        duration: Video duration in seconds
+        
+    Returns:
+        List of timestamps for fallback sampling
+    """
+    if not config.FALLBACK_SAMPLING_ENABLED:
+        return []
+    
+    interval = config.FALLBACK_INTERVAL_SEC
+    max_samples = config.FALLBACK_MAX_SAMPLES
+    
+    # Generate timestamps every interval seconds
+    timestamps = []
+    current_time = interval  # Start after first interval to avoid start of video
+    
+    while current_time < duration - interval and len(timestamps) < max_samples:
+        timestamps.append(current_time)
+        current_time += interval
+    
+    logger.info(f"Generated {len(timestamps)} fallback timestamps (every {interval}s)")
+    return timestamps
+
+
 def get_audio_peaks(video_path: str, use_bandpass: bool = True) -> List[AudioPeak]:
     """
-    Main function to extract audio peaks from video.
+    Main function to extract audio peaks from video with fallback sampling.
     
     Args:
         video_path: Path to input video file
@@ -236,7 +246,26 @@ def get_audio_peaks(video_path: str, use_bandpass: bool = True) -> List[AudioPea
         # Detect peaks
         peaks = detect_peaks(rms_envelope, duration, bandpass_energy)
         
-        logger.info(f"Audio analysis complete: {len(peaks)} peaks detected")
+        # If no peaks found, generate fallback samples
+        if not peaks and config.FALLBACK_SAMPLING_ENABLED:
+            logger.warning(f"No audio peaks detected, using fallback sampling")
+            fallback_timestamps = generate_fallback_timestamps(duration)
+            
+            # Create artificial peaks from fallback timestamps
+            fallback_peaks = []
+            for timestamp in fallback_timestamps:
+                # Create a low-confidence peak for fallback sampling
+                peak = AudioPeak(
+                    timestamp=timestamp, 
+                    amplitude=0.1,  # Low amplitude since no actual peak
+                    bandpass_ratio=0.1
+                )
+                fallback_peaks.append(peak)
+            
+            logger.info(f"Created {len(fallback_peaks)} fallback peaks for Gemini analysis")
+            peaks = fallback_peaks
+        
+        logger.info(f"Audio analysis complete: {len(peaks)} peaks detected ({len([p for p in peaks if p.confidence > 0.3])} high-confidence)")
         return peaks
         
     finally:

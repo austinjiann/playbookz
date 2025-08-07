@@ -61,6 +61,9 @@ Thumbs.db
 temp/
 tmp/
 
+# Environment files
+.env
+
 # Logs
 *.log
 run-summary-*.json

@@ -34,10 +34,29 @@ class HighlightClip:
         """Check if this clip overlaps with another within threshold."""
         return abs(self.start_time - other.start_time) < threshold or abs(self.end_time - other.end_time) < threshold
     
+    def is_within_merge_window(self, other: 'HighlightClip') -> bool:
+        """Check if clips are within dynamic merge window for extension."""
+        if not config.DYNAMIC_CLIP_EXTENSION:
+            return False
+        
+        # Check if clips are close enough to merge
+        time_gap = min(
+            abs(self.end_time - other.start_time),    # Gap between end of self and start of other
+            abs(other.end_time - self.start_time)     # Gap between end of other and start of self
+        )
+        return time_gap <= config.MERGE_WINDOW_SEC
+    
     def merge_with(self, other: 'HighlightClip') -> 'HighlightClip':
-        """Merge this clip with another overlapping clip."""
+        """Merge this clip with another overlapping clip with dynamic extension."""
         start_time = min(self.start_time, other.start_time)
         end_time = max(self.end_time, other.end_time)
+        
+        # If dynamic extension is enabled and clips are close, extend further
+        if config.DYNAMIC_CLIP_EXTENSION and self.is_within_merge_window(other):
+            # Extend the merged clip slightly to capture more context
+            extension = config.MERGE_WINDOW_SEC / 2  # Extend by half the merge window
+            start_time = max(0, start_time - extension)
+            end_time = end_time + extension
         
         # Combine sources and take max confidence
         sources = sorted(set([self.source, other.source]))
@@ -51,8 +70,16 @@ class HighlightClip:
 
 
 def extract_scoreboard_clips(video_path: str) -> List[HighlightClip]:
-    """Extract highlight clips using scoreboard OCR method."""
-    logger.info("Extracting highlights using scoreboard method")
+    """
+    DEPRECATED: Extract highlight clips using scoreboard OCR method.
+    This method is preserved for future broadcast video support but disabled by default.
+    Use audio mode for universal athlete video analysis.
+    """
+    if not config.ENABLE_SCOREBOARD:
+        logger.warning("Scoreboard analysis is disabled - skipping OCR extraction")
+        return []
+    
+    logger.info("Extracting highlights using scoreboard method (DEPRECATED)")
     
     try:
         # Use existing OCR-based analysis
@@ -137,11 +164,11 @@ async def extract_audio_clips(video_path: str) -> List[HighlightClip]:
 
 
 def merge_overlapping_clips(clips: List[HighlightClip]) -> List[HighlightClip]:
-    """Merge overlapping clips to avoid duplication."""
+    """Merge overlapping clips with dynamic extension support."""
     if not clips:
         return []
     
-    logger.info(f"Merging {len(clips)} clips")
+    logger.info(f"Merging {len(clips)} clips (dynamic extension: {config.DYNAMIC_CLIP_EXTENSION})")
     
     # Sort clips by start time
     clips.sort(key=lambda c: c.start_time)
@@ -150,71 +177,129 @@ def merge_overlapping_clips(clips: List[HighlightClip]) -> List[HighlightClip]:
     for current in clips[1:]:
         last_merged = merged[-1]
         
-        if current.overlaps_with(last_merged):
+        # Check for traditional overlap or dynamic merge window
+        should_merge = (
+            current.overlaps_with(last_merged) or 
+            (config.DYNAMIC_CLIP_EXTENSION and current.is_within_merge_window(last_merged))
+        )
+        
+        if should_merge:
             # Merge with the last clip
-            merged[-1] = last_merged.merge_with(current)
+            merged_clip = last_merged.merge_with(current)
+            merged[-1] = merged_clip
+            logger.debug(f"Merged clips: {last_merged.start_time:.1f}-{last_merged.end_time:.1f}s + {current.start_time:.1f}-{current.end_time:.1f}s → {merged_clip.start_time:.1f}-{merged_clip.end_time:.1f}s")
         else:
-            # No overlap, add as new clip
+            # No overlap or merge condition, add as new clip
             merged.append(current)
     
-    logger.info(f"Merged to {len(merged)} clips")
+    logger.info(f"Merged to {len(merged)} clips with total duration: {sum(c.duration for c in merged):.1f}s")
     return merged
 
 
 def fast_concat(clips: List[HighlightClip], video_path: str, output_path: str) -> Optional[str]:
-    """Fast concatenation of video clips using MoviePy."""
+    """Fast concatenation of video clips using MoviePy with enhanced debugging."""
     if not clips:
-        logger.warning("No clips to concatenate")
+        logger.warning("No clips to concatenate - returning None")
         return None
     
     logger.info(f"Concatenating {len(clips)} clips to {output_path}")
+    logger.info(f"Clips to process: {[f'{c.start_time:.1f}-{c.end_time:.1f}s ({c.source})' for c in clips]}")
     
     try:
         # Load video
         video = VideoFileClip(video_path)
         video_duration = video.duration
+        logger.info(f"Source video duration: {video_duration:.1f}s")
         
-        # Create subclips
+        # Create subclips with validation
         subclips = []
-        for clip in clips:
+        valid_clips_found = 0
+        
+        for i, clip in enumerate(clips):
             # Ensure clip is within video bounds
             start = max(0, clip.start_time)
             end = min(video_duration, clip.end_time)
             
-            if end > start:
+            # Validate clip duration
+            clip_duration = end - start
+            if clip_duration <= 0:
+                logger.warning(f"Clip {i+1} has invalid duration: {start:.1f}-{end:.1f}s (duration: {clip_duration:.1f}s)")
+                continue
+            
+            if clip_duration < 1.0:  # Skip clips shorter than 1 second
+                logger.warning(f"Clip {i+1} too short: {clip_duration:.1f}s, skipping")
+                continue
+            
+            try:
                 subclip = video.subclip(start, end)
-                subclips.append(subclip)
-                logger.debug(f"Added clip: {start:.1f}-{end:.1f}s ({clip.source})")
+                # Validate subclip has content
+                if subclip.duration > 0:
+                    subclips.append(subclip)
+                    valid_clips_found += 1
+                    logger.info(f"✅ Added clip {i+1}: {start:.1f}-{end:.1f}s (duration: {clip_duration:.1f}s) from {clip.source}")
+                else:
+                    logger.warning(f"❌ Clip {i+1} has 0 duration after subclip creation")
+            except Exception as e:
+                logger.error(f"❌ Failed to create subclip {i+1}: {e}")
+                continue
         
-        if not subclips:
-            logger.error("No valid clips to concatenate")
+        if not subclips or valid_clips_found == 0:
+            logger.error(f"No valid clips found! Processed {len(clips)} input clips, got {len(subclips)} subclips")
+            video.close()
             return None
         
+        logger.info(f"Successfully created {len(subclips)} valid subclips")
+        
         # Concatenate clips
-        final_video = concatenate_videoclips(subclips)
+        try:
+            final_video = concatenate_videoclips(subclips)
+            logger.info(f"Concatenation successful, final video duration: {final_video.duration:.1f}s")
+        except Exception as e:
+            logger.error(f"Failed to concatenate clips: {e}")
+            video.close()
+            for subclip in subclips:
+                subclip.close()
+            return None
         
-        # Write output
-        final_video.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            temp_audiofile='temp-audio.m4a',
-            remove_temp=True,
-            verbose=False,
-            logger=None
-        )
+        # Write output with better error handling
+        try:
+            logger.info(f"Writing video to {output_path}...")
+            final_video.write_videofile(
+                output_path,
+                codec='libx264',
+                audio_codec='aac',
+                temp_audiofile='temp-audio.m4a',
+                remove_temp=True,
+                verbose=False,
+                logger=None
+            )
+            logger.info(f"✅ Video written successfully to {output_path}")
+        except Exception as e:
+            logger.error(f"Failed to write video file: {e}")
+            return None
+        finally:
+            # Cleanup
+            video.close()
+            final_video.close()
+            for subclip in subclips:
+                subclip.close()
         
-        # Cleanup
-        video.close()
-        final_video.close()
-        for subclip in subclips:
-            subclip.close()
-        
-        logger.info(f"Highlights saved to {output_path}")
-        return output_path
+        # Verify output file
+        try:
+            from pathlib import Path
+            output_file = Path(output_path)
+            if output_file.exists() and output_file.stat().st_size > 1000:  # At least 1KB
+                logger.info(f"✅ Output file verified: {output_path} ({output_file.stat().st_size} bytes)")
+                return output_path
+            else:
+                logger.error(f"❌ Output file invalid or too small: {output_path}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to verify output file: {e}")
+            return None
         
     except Exception as e:
-        logger.error(f"Video concatenation failed: {e}")
+        logger.error(f"Video concatenation failed with exception: {e}")
         return None
 
 
@@ -321,14 +406,30 @@ def create_run_summary(
 
 async def main():
     """Main CLI entry point."""
-    parser = argparse.ArgumentParser(description="Generate football highlights")
+    parser = argparse.ArgumentParser(description="Generate football highlights for athletes")
     parser.add_argument('--video', required=True, help='Path to input video')
-    parser.add_argument('--mode', choices=['scoreboard', 'audio', 'hybrid'], 
-                       default='hybrid', help='Detection mode')
+    
+    # Determine available modes based on configuration
+    available_modes = ['audio']
+    if config.ENABLE_SCOREBOARD:
+        available_modes.extend(['scoreboard', 'hybrid'])
+        default_mode = 'hybrid'
+        mode_help = 'Detection mode: audio (universal), scoreboard (broadcast only), hybrid (combines both)'
+    else:
+        default_mode = 'audio'
+        mode_help = 'Detection mode: audio (universal sports video analysis)'
+    
+    parser.add_argument('--mode', choices=available_modes, 
+                       default=default_mode, help=mode_help)
     parser.add_argument('--output', default='highlights.mp4', help='Output video path')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     
     args = parser.parse_args()
+    
+    # Validate scoreboard mode usage
+    if args.mode in ['scoreboard', 'hybrid'] and not config.ENABLE_SCOREBOARD:
+        logger.error(f"Scoreboard mode is disabled. Use --mode audio for universal athlete support.")
+        return 1
     
     # Configure logging
     log_level = "DEBUG" if args.debug else config.LOG_LEVEL
@@ -338,6 +439,14 @@ async def main():
         level=log_level,
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}"
     )
+    
+    # Show mode info
+    if args.mode == 'audio':
+        logger.info("🎵 Audio mode: Universal analysis for any sports video")
+    elif args.mode == 'scoreboard':
+        logger.info("📊 Scoreboard mode: Broadcast video with visible scoreboard")
+    elif args.mode == 'hybrid':
+        logger.info("🔄 Hybrid mode: Combines audio analysis + scoreboard detection")
     
     # Validate configuration
     try:

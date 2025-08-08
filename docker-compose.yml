@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  highlight-generator:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MAX_UPLOAD_MB=2048
+      - MAX_CONCURRENT_JOBS=2
+      - JOB_TIMEOUT_HOURS=2
+      - STRUCTURED_PROGRESS=true
+      - ADMIN_KEY=admin123
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./data:/app/data:ro  # For serving large files
+    depends_on:
+      - highlight-generator
+    restart: unless-stopped

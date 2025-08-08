@@ -3,11 +3,11 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
-This is a universal AI-driven sports highlight generator that works with **any football/sports video** - from phone recordings to broadcast footage. The system combines audio signal processing with Gemini Vision API validation to automatically identify and extract exciting moments without requiring visible scoreboards or specific video quality.
+This is a universal AI-driven sports highlight generator that works with **any football/sports video** - from phone recordings to broadcast footage. The system combines audio signal processing with Gemini Vision API validation and Expected Goals (xG) modeling to automatically identify and extract exciting moments without requiring visible scoreboards or specific video quality.
 
 ## Core Architecture
 
-The system implements a two-stage pipeline that processes **any sports video format**:
+The system implements a four-stage pipeline that processes **any sports video format**:
 
 ### Stage 1: Audio Signal Analysis (`audio_analysis.py`)
 - **Direct audio extraction**: Uses librosa to extract audio from any video container format
@@ -23,11 +23,18 @@ The system implements a two-stage pipeline that processes **any sports video for
 - **Async processing**: Concurrent API calls with rate limiting and retry logic
 - **SQLite caching**: Stores frame analysis results to minimize API costs and enable replay
 
-### Stage 3: Intelligent Clip Generation (`gen_highlights.py`)
-- **HighlightClip class**: Represents clips with timestamp, confidence, source metadata
+### Stage 3: xG Enhancement (`gemini_filter.py` + `models/xg_model.py`)
+- **Shot detection**: Identifies shot events during Gemini validation
+- **Coordinate estimation**: Maps frame positions to StatsBomb pitch coordinates (120x80)
+- **Context inference**: Extracts body part, set piece status, and play context
+- **xG calculation**: Uses trained logistic regression model on StatsBomb data
+- **Score blending**: Combines Gemini confidence with xG values using configurable weights
+
+### Stage 4: Intelligent Clip Generation (`gen_highlights.py`)
+- **HighlightClip class**: Represents clips with timestamp, confidence, source metadata, and xG data
+- **Enhanced ranking**: Sorts clips by blended Gemini+xG scores when enabled
 - **Dynamic merging**: Combines nearby exciting moments into extended highlight sequences
 - **Overlap resolution**: Merges clips within configurable time windows (4-second default)
-- **Smart ranking**: Sorts clips by confidence scores, limits output to prevent excessive length
 
 ### Legacy: Scoreboard Analysis (Deprecated)
 - **OCR-based detection**: Uses PaddleOCR + YOLOv8 for scoreboard text extraction
@@ -57,8 +64,14 @@ export GEMINI_API_KEY="your-key-here"
 # Primary mode - works on any sports video
 python gen_highlights.py --video match.mp4 --mode audio --output highlights.mp4
 
-# Debug mode with detailed logging
-python gen_highlights.py --video match.mp4 --mode audio --debug
+# xG-enhanced highlighting with intelligent shot ranking
+python gen_highlights.py --video match.mp4 --mode audio --use-xg --output highlights.mp4
+
+# Custom xG weighting (higher = more influence of shot quality)
+python gen_highlights.py --video match.mp4 --mode audio --use-xg --xg-weight 0.5
+
+# Debug mode with detailed xG logging
+python gen_highlights.py --video match.mp4 --mode audio --use-xg --debug
 
 # Preview tool - analyze without rendering video
 python tools/preview_clips.py --video match.mp4 --output debug_preview
@@ -68,6 +81,9 @@ python audio_analysis.py match.mp4
 
 # Direct Gemini frame testing
 python gemini_filter.py match.mp4
+
+# Train xG model (first-time setup)
+python scripts/train_xg.py
 ```
 
 ### Testing Commands
@@ -97,6 +113,8 @@ pytest tests/test_audio_pipeline.py::TestAudioPeak::test_peak_creation -v
 
 ### AI Integration Stack  
 - **google-generativeai**: Gemini Vision API client for frame analysis
+- **scikit-learn**: Logistic regression for xG model training and prediction
+- **statsbombpy**: Open football data API for xG model training
 - **asyncio**: Concurrent processing for multiple API calls
 - **sqlite3**: Local caching database for API responses
 
@@ -126,6 +144,13 @@ The system's effectiveness depends on properly tuned audio parameters in `config
 - `DYNAMIC_CLIP_EXTENSION = True`: Automatically merge nearby exciting moments
 - `MERGE_WINDOW_SEC = 4`: Maximum gap for merging separate clips into sequences
 
+### xG Model Configuration
+- **Training data**: StatsBomb open data (FIFA World Cup, La Liga, etc.)
+- **Model type**: Logistic regression with shot features (distance, angle, body part, context)
+- **Coordinate system**: StatsBomb 120x80 pitch, goal at (120, 40)
+- **Runtime**: No dataset dependency - coefficients stored in `data/xg_coeffs.json`
+- **Integration**: Optional via `--use-xg` flag, configurable weight with `--xg-weight`
+
 ## Development Workflow Patterns
 
 ### Debugging Failed Analysis
@@ -147,6 +172,11 @@ When highlights aren't generated properly, follow this diagnostic sequence:
    - Detailed logging of each processing stage
    - Shows clip merging and concatenation steps
 
+5. **Test xG integration**: `python gen_highlights.py --video video.mp4 --use-xg --debug`
+   - Shows xG calculations and coordinate estimation
+   - Displays score blending: `Gemini=0.8 + xG=0.25 → Blended=0.635`
+   - Verifies shot detection and context inference
+
 ### Performance Optimization Patterns
 - **Cache utilization**: Gemini responses cached in `.cache/gemini.db` - reprocessing same video is much faster
 - **API cost control**: `FALLBACK_MAX_SAMPLES = 20` limits fallback sampling to prevent excessive API calls
@@ -162,6 +192,15 @@ pytest tests/test_audio_pipeline.py::TestGeminiFilter -v
 
 # Integration tests (comprehensive but slower)
 pytest tests/test_audio_pipeline.py::TestIntegration -v
+
+# Test xG model functionality
+python -c "from models.xg_model import predict_xg; print(f'xG test: {predict_xg(x=108, y=40, body_part=\"right_foot\", is_set_piece=True):.3f}')"
+
+# Verify xG training data exists
+ls -la data/xg_coeffs.json
+
+# Test xG integration components
+python -c "from gemini_filter import _placeholder_pitch_coordinates; print('Coordinate mapping:', _placeholder_pitch_coordinates((720, 1280)))"
 ```
 
 ## Video Format Support
@@ -221,6 +260,12 @@ This system is designed to work with **ANY sports video**, including:
    - Use preview tool to see what Gemini is analyzing
    - Check video contains actual sports action (not just static shots)
 
+5. **"xG model not working"**
+   - Verify coefficients exist: `ls -la data/xg_coeffs.json`
+   - Train model if missing: `python scripts/train_xg.py`
+   - Test prediction: `from models.xg_model import predict_xg; predict_xg(x=108, y=40)`
+   - Check for coordinate mapping issues in debug logs
+
 ### Performance Optimization
 - **Cache usage**: Gemini responses are cached in SQLite to reduce API costs
 - **Concurrent processing**: 8 concurrent API calls for faster analysis  
@@ -230,7 +275,9 @@ This system is designed to work with **ANY sports video**, including:
 ## Testing
 Run test suite: `pytest tests/ -v --asyncio-mode=auto`
 
-## Recent Enhancements (Universal Athlete Update)
+## Recent Enhancements
+
+### Universal Athlete Update
 - ✅ **Universal video support**: No longer requires broadcast footage with scoreboards
 - ✅ **Enhanced sensitivity**: Lower thresholds catch more subtle exciting moments
 - ✅ **Fallback sampling**: Works even on silent or low-audio videos
@@ -239,3 +286,19 @@ Run test suite: `pytest tests/ -v --asyncio-mode=auto`
 - ✅ **Comprehensive debugging tools**: HTML preview, JSON summaries, direct testing
 - ✅ **0-duration video bug fix**: Enhanced validation and error handling
 - ✅ **Simplified CLI**: Audio mode is default, scoreboard mode deprecated
+
+### xG Integration Update  
+- ✅ **Expected Goals model**: Trained on StatsBomb open data with logistic regression
+- ✅ **Shot detection**: Identifies shot events during Gemini validation
+- ✅ **Coordinate mapping**: Maps video positions to StatsBomb pitch coordinates
+- ✅ **Smart ranking**: Blends Gemini confidence with xG for enhanced highlight selection
+- ✅ **CLI enhancement**: `--use-xg` and `--xg-weight` flags for configurable integration
+- ✅ **Debug visibility**: Real-time xG calculations and score blending in logs
+- ✅ **JSON metadata**: xG values included in run summaries and clip data
+- ✅ **Backward compatibility**: Works with or without xG, graceful fallback
+
+### Web Application Architecture (Docker Deployment)
+- ✅ **Containerized deployment**: Docker + nginx setup for production
+- ✅ **Health monitoring**: Health check endpoints and container management
+- ✅ **Environment configuration**: Configurable via environment variables
+- ✅ **Scalable architecture**: Multi-service deployment with volume management

@@ -103,6 +103,37 @@ def validate_config():
     if BANDPASS[0] >= BANDPASS[1]:
         raise ValueError("BANDPASS frequencies must be in ascending order")
 
+# --- GEMINI VISION PROMPTS ---
+GEMINI_PROMPT_SCAN = (
+    "You are analyzing a football (soccer) video frame. "
+    "Classify if this frame likely shows a SHOT, GOAL, CELEBRATION, SAVE, or OTHER. "
+    "Pay special attention to: ball crossing the goal line, net ripples, goalkeeper beaten, "
+    "players immediately celebrating, referee pointing to center circle. "
+    "Return JSON only with keys: label, confidence, entities: {ball_bbox, body_part, phase, pitch_hint}."
+)
+
+GEMINI_PROMPT_PRECISION = (
+    "Focus on detecting the instant of GOAL vs SHOT. "
+    "If the ball is crossing the goal line or inside the net, label=goal. "
+    "If a player is striking towards goal, label=shot. "
+    "Return compact JSON: {\"label\": \"goal|shot\", \"confidence\": 0.8, \"entities\": {\"ball_bbox\": [x1,y1,x2,y2], \"body_part\": \"left_foot|right_foot|head|other\", \"phase\": \"set_piece|open_play\", \"pitch_hint\": {\"goal_side\": \"left|right|unknown\"}}, \"schema\": \"v1\"}."
+)
+
+# --- VISION-FIRST PIPELINE DEFAULTS ---
+VISION_FRAME_STRIDE_SEC = 0.75        # Base stride for scanning video with Gemini
+VISION_MICRO_WINDOW_SEC = 2.0         # +/- window around detections to sample densely
+VISION_MICRO_STEP_SEC = 0.25          # Step inside micro window
+VISION_GOAL_BACKTRACK_SEC = 6.0       # When we see celebration, look back this much for the actual goal/shot
+VISION_MIN_EVENT_CONF = 0.45          # Gemini confidence threshold for events in vision-first
+VISION_MAX_EVENTS = 500               # Soft cap to avoid runaway API cost
+VISION_MAX_FRAMES = 1200              # Hard cap on total frames processed per video
+
+# Clip timing tweaks by event type
+CLIP_PAD_SHOT_PRE_SEC = 6
+CLIP_PAD_SHOT_POST_SEC = 8
+CLIP_PAD_GOAL_PRE_SEC = 8
+CLIP_PAD_GOAL_POST_SEC = 12
+
 if __name__ == "__main__":
     validate_config()
     print("Configuration validation passed!")

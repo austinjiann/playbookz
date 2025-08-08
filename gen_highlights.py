@@ -17,17 +17,24 @@ from loguru import logger
 import config
 from get_dataframe import get_dataframe
 from audio_analysis import get_audio_peaks
-from gemini_filter import validate_audio_peaks
+from gemini_filter import validate_audio_peaks, validate_audio_peaks_with_xg, analyze_video_vision_first
+
+# xG model integration with safe fallback
+try:
+    from models.xg_model import predict_xg
+except Exception:
+    predict_xg = None
 
 
 class HighlightClip:
     """Represents a highlight clip with metadata."""
     
-    def __init__(self, start_time: float, end_time: float, source: str, confidence: float = 1.0):
+    def __init__(self, start_time: float, end_time: float, source: str, confidence: float = 1.0, xg: Optional[float] = None):
         self.start_time = max(0, start_time)  # Ensure non-negative
         self.end_time = end_time
         self.source = source  # 'scoreboard', 'audio', 'hybrid'
         self.confidence = confidence
+        self.xg = xg  # Expected Goals value if available
         self.duration = self.end_time - self.start_time
     
     def overlaps_with(self, other: 'HighlightClip', threshold: float = config.CLIP_OVERLAP_THRESHOLD) -> bool:
@@ -63,10 +70,29 @@ class HighlightClip:
         source = '+'.join(sources)
         confidence = max(self.confidence, other.confidence)
         
-        return HighlightClip(start_time, end_time, source, confidence)
+        # Take max xG if available
+        merged_xg = None
+        if self.xg is not None and other.xg is not None:
+            merged_xg = max(self.xg, other.xg)
+        elif self.xg is not None:
+            merged_xg = self.xg
+        elif other.xg is not None:
+            merged_xg = other.xg
+        
+        return HighlightClip(start_time, end_time, source, confidence, xg=merged_xg)
     
     def __repr__(self):
-        return f"HighlightClip({self.start_time:.1f}-{self.end_time:.1f}s, {self.source}, conf={self.confidence:.2f})"
+        xg_str = f", xG={self.xg:.3f}" if self.xg is not None else ""
+        return f"HighlightClip({self.start_time:.1f}-{self.end_time:.1f}s, {self.source}, conf={self.confidence:.2f}{xg_str})"
+
+
+def _blend_conf_with_xg(base_conf: float, xg: Optional[float], use_xg: bool, xg_weight: float) -> float:
+    """Blend Gemini confidence with xG score for enhanced ranking."""
+    if not use_xg or xg is None:
+        return base_conf
+    w = max(0.0, min(1.0, xg_weight))
+    # Blend: both values expected in [0,1] range
+    return (1.0 - w) * base_conf + w * xg
 
 
 def extract_scoreboard_clips(video_path: str) -> List[HighlightClip]:
@@ -121,7 +147,70 @@ def extract_scoreboard_clips(video_path: str) -> List[HighlightClip]:
         return []
 
 
-async def extract_audio_clips(video_path: str) -> List[HighlightClip]:
+async def extract_vision_first_clips(video_path: str, use_xg: bool = False, 
+                                     vision_stride: float = None, 
+                                     vision_max_frames: int = None,
+                                     vision_min_conf: float = None) -> List[HighlightClip]:
+    """Extract highlight clips using vision-first systematic scanning."""
+    logger.info("Extracting highlights using vision-first method")
+    
+    try:
+        # Use CLI args or config defaults
+        stride = vision_stride if vision_stride is not None else config.VISION_FRAME_STRIDE_SEC
+        max_frames = vision_max_frames if vision_max_frames is not None else config.VISION_MAX_FRAMES
+        min_conf = vision_min_conf if vision_min_conf is not None else config.VISION_MIN_EVENT_CONF
+        
+        # Run vision-first analysis
+        events = analyze_video_vision_first(
+            video_path=video_path,
+            frame_stride_sec=stride,
+            micro_window_sec=config.VISION_MICRO_WINDOW_SEC,
+            micro_step_sec=config.VISION_MICRO_STEP_SEC,
+            min_event_conf=min_conf,
+            goal_backtrack_sec=config.VISION_GOAL_BACKTRACK_SEC,
+            max_events=config.VISION_MAX_EVENTS,
+            max_frames=max_frames
+        )
+        
+        if not events:
+            logger.warning("No events detected in vision-first analysis")
+            return []
+        
+        # Convert events to HighlightClip objects with event-aware padding
+        clips = []
+        for event in events:
+            timestamp = event['timestamp']
+            label = event.get('label', '').lower()
+            confidence = event.get('confidence', 0.7)
+            xg_value = event.get('xg')
+            
+            # Event-aware clip padding
+            if any(pattern in label for pattern in ['goal', 'scores']):
+                pre_sec = config.CLIP_PAD_GOAL_PRE_SEC
+                post_sec = config.CLIP_PAD_GOAL_POST_SEC
+            elif any(pattern in label for pattern in ['shot', 'attempt']):
+                pre_sec = config.CLIP_PAD_SHOT_PRE_SEC  
+                post_sec = config.CLIP_PAD_SHOT_POST_SEC
+            else:
+                # Default padding for celebrations, saves, etc.
+                pre_sec = config.PRE_SEC
+                post_sec = config.POST_SEC
+            
+            start_time = timestamp - pre_sec
+            end_time = timestamp + post_sec
+            
+            clip = HighlightClip(start_time, end_time, 'vision-first', confidence, xg=xg_value)
+            clips.append(clip)
+        
+        logger.info(f"Found {len(clips)} vision-first clips")
+        return clips
+        
+    except Exception as e:
+        logger.error(f"Vision-first extraction failed: {e}")
+        return []
+
+
+async def extract_audio_clips(video_path: str, use_xg: bool = False) -> List[HighlightClip]:
     """Extract highlight clips using audio peak detection + Gemini validation."""
     logger.info("Extracting highlights using audio method")
     
@@ -136,23 +225,28 @@ async def extract_audio_clips(video_path: str) -> List[HighlightClip]:
         # Extract timestamps from top peaks
         peak_timestamps = [peak.timestamp for peak in audio_peaks[:20]]  # Top 20 peaks
         
-        # Validate with Gemini Vision
-        validated_timestamps = await validate_audio_peaks(video_path, peak_timestamps)
+        # Validate with Gemini Vision (with or without xG)
+        if use_xg and predict_xg is not None:
+            validated_events = await validate_audio_peaks_with_xg(video_path, peak_timestamps)
+        else:
+            validated_timestamps = await validate_audio_peaks(video_path, peak_timestamps)
+            validated_events = [{'timestamp': ts, 'confidence': 0.8, 'xg': None} for ts in validated_timestamps]
         
-        # Create clips around validated peaks
+        # Create clips around validated events
         clips = []
-        for timestamp in validated_timestamps:
+        for event in validated_events:
+            timestamp = event['timestamp']
             start_time = timestamp - config.PRE_SEC
             end_time = timestamp + config.POST_SEC
             
-            # Find corresponding peak for confidence
-            confidence = 0.7  # Default
+            # Find corresponding peak for base confidence
+            confidence = event.get('confidence', 0.7)
             for peak in audio_peaks:
                 if abs(peak.timestamp - timestamp) < 1.0:  # Within 1 second
                     confidence = peak.confidence
                     break
             
-            clip = HighlightClip(start_time, end_time, 'audio', confidence)
+            clip = HighlightClip(start_time, end_time, 'audio', confidence, xg=event.get('xg'))
             clips.append(clip)
         
         logger.info(f"Found {len(clips)} audio-based clips")
@@ -306,7 +400,10 @@ def fast_concat(clips: List[HighlightClip], video_path: str, output_path: str) -
 async def generate_highlights(
     video_path: str, 
     mode: str = 'hybrid', 
-    output_path: str = 'highlights.mp4'
+    output_path: str = 'highlights.mp4',
+    use_xg: bool = False,
+    xg_weight: float = 0.3,
+    args=None  # Pass CLI args for vision-first tunability
 ) -> Optional[str]:
     """
     Generate highlights using specified mode.
@@ -335,18 +432,38 @@ async def generate_highlights(
             clips.extend(scoreboard_clips)
         
         if mode in ['audio', 'hybrid']:
-            audio_clips = await extract_audio_clips(video_path)
+            audio_clips = await extract_audio_clips(video_path, use_xg=use_xg)
             clips.extend(audio_clips)
+        
+        if getattr(args, 'experimental_vision_first', False):
+            # Extract vision-first parameters from args if available
+            vision_stride = getattr(args, 'vision_stride', None) if args else None
+            vision_max_frames = getattr(args, 'vision_max_frames', None) if args else None
+            vision_min_conf = getattr(args, 'vision_min_conf', None) if args else None
+            
+            vision_clips = await extract_vision_first_clips(
+                video_path, use_xg=use_xg,
+                vision_stride=vision_stride,
+                vision_max_frames=vision_max_frames, 
+                vision_min_conf=vision_min_conf
+            )
+            clips.extend(vision_clips)
         
         # Merge overlapping clips
         merged_clips = merge_overlapping_clips(clips)
         
         if not merged_clips:
             logger.warning("No highlight clips found")
-            return None
+            return None, []
         
-        # Sort by confidence and take top clips if too many
-        merged_clips.sort(key=lambda c: c.confidence, reverse=True)
+        # Apply xG-enhanced ranking if enabled
+        for clip in merged_clips:
+            clip.blended_score = _blend_conf_with_xg(clip.confidence, clip.xg, use_xg, xg_weight)
+            if use_xg and clip.xg is not None:
+                logger.debug(f"Clip {clip.start_time:.1f}s: Gemini={clip.confidence:.3f} + xG={clip.xg:.3f} → Blended={clip.blended_score:.3f}")
+        
+        # Sort by blended score and take top clips if too many
+        merged_clips.sort(key=lambda c: getattr(c, 'blended_score', c.confidence), reverse=True)
         if len(merged_clips) > 10:  # Limit to top 10 clips
             merged_clips = merged_clips[:10]
             logger.info(f"Limited to top {len(merged_clips)} clips")
@@ -361,11 +478,11 @@ async def generate_highlights(
         total_duration = sum(clip.duration for clip in merged_clips)
         logger.info(f"Generated {len(merged_clips)} clips, total duration: {total_duration:.1f}s")
         
-        return result_path
+        return result_path, merged_clips
         
     except Exception as e:
         logger.error(f"Highlight generation failed: {e}")
-        return None
+        return None, []
 
 
 def create_run_summary(
@@ -392,7 +509,9 @@ def create_run_summary(
                 "end_time": clip.end_time,
                 "duration": clip.duration,
                 "source": clip.source,
-                "confidence": clip.confidence
+                "confidence": clip.confidence,
+                "xg": None if clip.xg is None else float(clip.xg),
+                "blended_score": getattr(clip, 'blended_score', clip.confidence)
             } for clip in clips
         ] if clips else [],
         "total_duration": sum(clip.duration for clip in clips) if clips else 0
@@ -417,12 +536,24 @@ async def main():
         mode_help = 'Detection mode: audio (universal), scoreboard (broadcast only), hybrid (combines both)'
     else:
         default_mode = 'audio'
-        mode_help = 'Detection mode: audio (universal sports video analysis)'
+        mode_help = 'Detection mode: audio (universal sports video analysis with crowd excitement detection)'
     
     parser.add_argument('--mode', choices=available_modes, 
                        default=default_mode, help=mode_help)
     parser.add_argument('--output', default='highlights.mp4', help='Output video path')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--use-xg', action='store_true', help='Use xG to influence highlight ranking when available')
+    parser.add_argument('--xg-weight', type=float, default=0.3, help='Weight (0..1) to blend xG with model confidence')
+    
+    # Experimental vision-first mode (hidden from main help)
+    parser.add_argument('--experimental-vision-first', action='store_true', 
+                       help=argparse.SUPPRESS)  # Hidden experimental feature
+    parser.add_argument('--vision-stride', type=float, default=config.VISION_FRAME_STRIDE_SEC, 
+                       help=argparse.SUPPRESS)
+    parser.add_argument('--vision-max-frames', type=int, default=config.VISION_MAX_FRAMES,
+                       help=argparse.SUPPRESS)
+    parser.add_argument('--vision-min-conf', type=float, default=config.VISION_MIN_EVENT_CONF,
+                       help=argparse.SUPPRESS)
     
     args = parser.parse_args()
     
@@ -430,6 +561,11 @@ async def main():
     if args.mode in ['scoreboard', 'hybrid'] and not config.ENABLE_SCOREBOARD:
         logger.error(f"Scoreboard mode is disabled. Use --mode audio for universal athlete support.")
         return 1
+    
+    # Validate xG usage
+    if args.use_xg and predict_xg is None:
+        logger.warning("xG model not available - continuing without xG integration")
+        args.use_xg = False
     
     # Configure logging
     log_level = "DEBUG" if args.debug else config.LOG_LEVEL
@@ -442,15 +578,18 @@ async def main():
     
     # Show mode info
     if args.mode == 'audio':
-        logger.info("🎵 Audio mode: Universal analysis for any sports video")
+        logger.info("🎵 Audio mode: Universal analysis using crowd excitement detection + AI validation")
     elif args.mode == 'scoreboard':
         logger.info("📊 Scoreboard mode: Broadcast video with visible scoreboard")
     elif args.mode == 'hybrid':
         logger.info("🔄 Hybrid mode: Combines audio analysis + scoreboard detection")
     
+    if getattr(args, 'experimental_vision_first', False):
+        logger.info(f"👁️ [EXPERIMENTAL] Vision-first mode enabled ({args.vision_stride:.2f}s stride, max {args.vision_max_frames} frames)")
+    
     # Validate configuration
     try:
-        if args.mode in ['audio', 'hybrid']:
+        if args.mode in ['audio', 'hybrid'] or getattr(args, 'experimental_vision_first', False):
             config.validate_config()
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
@@ -459,7 +598,21 @@ async def main():
     # Generate highlights
     clips = []
     try:
-        result_path = await generate_highlights(args.video, args.mode, args.output)
+        result_data = await generate_highlights(
+            args.video, 
+            args.mode, 
+            args.output,
+            use_xg=args.use_xg,
+            xg_weight=args.xg_weight,
+            args=args  # Pass args for vision-first CLI tunability
+        )
+        
+        if isinstance(result_data, tuple):
+            result_path, clips = result_data
+        else:
+            result_path = result_data
+            clips = []
+            
         success = result_path is not None
         
         if success:

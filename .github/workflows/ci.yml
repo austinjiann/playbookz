@@ -28,8 +28,10 @@ jobs:
     
     - name: Install Python dependencies
       run: |
-        python -m pip install --upgrade pip
+        python -m pip install --upgrade pip wheel setuptools
         pip install -r requirements.txt
+        # Ensure video editing stack is present for tests
+        pip install moviepy imageio-ffmpeg
     
     - name: Run tests
       run: |

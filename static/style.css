@@ -1,0 +1,104 @@
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background-color: #f0f2f5;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    margin: 0;
+}
+
+.container {
+    background-color: #fff;
+    padding: 40px;
+    border-radius: 12px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    text-align: center;
+    max-width: 500px;
+    width: 100%;
+}
+
+h1 {
+    font-size: 28px;
+    color: #1c1e21;
+    margin-bottom: 12px;
+}
+
+p {
+    font-size: 16px;
+    color: #606770;
+    margin-bottom: 24px;
+}
+
+.upload-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+}
+
+#video-upload {
+    display: none;
+}
+
+.upload-btn, #submit-btn, .download-btn {
+    background-color: #1877f2;
+    color: #fff;
+    padding: 12px 24px;
+    border: none;
+    border-radius: 6px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 0.3s;
+}
+
+.upload-btn:hover, #submit-btn:hover, .download-btn:hover {
+    background-color: #166fe5;
+}
+
+#submit-btn {
+    background-color: #42b72a;
+}
+
+#submit-btn:hover {
+    background-color: #36a420;
+}
+
+.hidden {
+    display: none;
+}
+
+#progress-container {
+    margin-top: 24px;
+}
+
+.progress-bar {
+    background-color: #e4e6eb;
+    border-radius: 6px;
+    overflow: hidden;
+    width: 100%;
+    height: 12px;
+}
+
+.progress {
+    background-color: #1877f2;
+    width: 0;
+    height: 100%;
+    transition: width 0.4s;
+}
+
+#status-text {
+    margin-top: 8px;
+    font-size: 14px;
+    color: #606770;
+}
+
+#result-container {
+    margin-top: 24px;
+}
+
+.download-btn {
+    display: inline-block;
+    text-decoration: none;
+}
